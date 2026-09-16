@@ -664,3 +664,51 @@ def parse_sheet(rows: Sequence[Dict[str, str]], column_prefix: str = "manual"
             continue
         labels[lid] = vals
     return labels
+
+
+def adjudication_sheet(rows: Sequence[Dict[str, Any]], prefix_a: str,
+                       prefix_b: str, max_chars: int = 0
+                       ) -> List[Dict[str, Any]]:
+    out = []
+    for r in rows:
+        for lb in LABEL_NAMES:
+            a = str(r.get(f"{prefix_a}_{lb}", "")).upper()
+            b = str(r.get(f"{prefix_b}_{lb}", "")).upper()
+            if a not in (PRESENT, NOT_DETECTED, UNCLEAR) or b not in (PRESENT, NOT_DETECTED, UNCLEAR) or a == b:
+                continue
+            out.append({
+                "legend_id": r["legend_id"],
+                "label": lb,
+                f"{prefix_a}_says": a,
+                f"{prefix_b}_says": b,
+                "adjudicated": "",
+                "reason": "",
+                "rule_evidence": r.get(f"evidence_{lb}", ""),
+                "caption": (str(r.get("caption", ""))[:max_chars]
+                            if max_chars else str(r.get("caption", ""))),
+            })
+    return out
+
+
+def apply_adjudication(rows: Sequence[Dict[str, Any]],
+                       decisions: Sequence[Dict[str, str]],
+                       base_prefix: str = "gold") -> Tuple[List[Dict[str, Any]], int]:
+    by_key: Dict[Tuple[str, str], str] = {}
+    for d in decisions:
+        lid = str(d.get("legend_id", "")).strip()
+        lb = str(d.get("label", "")).strip()
+        v = normalise_value(str(d.get("adjudicated", "")).strip())
+        if v and lb in LABEL_NAMES:
+            by_key[(lid, lb)] = v
+    out, n = [], 0
+    for r in rows:
+        rec = dict(r)
+        for lb in LABEL_NAMES:
+            key = (str(r.get("legend_id", "")), lb)
+            if key in by_key:
+                rec[f"adj_{lb}"] = by_key[key]
+                n += 1
+            else:
+                rec[f"adj_{lb}"] = str(r.get(f"{base_prefix}_{lb}", "")).upper()
+        out.append(rec)
+    return out, n
