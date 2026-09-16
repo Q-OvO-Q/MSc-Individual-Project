@@ -11,10 +11,14 @@ from typing import Any, Dict, Iterable, List, Sequence
 import numpy as np
 
 from mlc import corpus as C
+from mlc import errors as E
 from mlc import evaluate as ev
+from mlc import spans as SP
 from mlc.checker import LegendChecker, render_text
 from mlc.config import LABEL_NAMES, PRESENT, RANDOM_SEED
 from mlc.models import LADDER, build_model_zoo, tune_thresholds
+
+ANNOTATOR_PREFIX = {"sheet": "gold", "retest": "human2", "second": "human3"}
 
 
 def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> Path:
@@ -54,6 +58,24 @@ def read_csv(path: Path) -> List[Dict[str, str]]:
         return list(csv.DictReader(fh))
 
 
+def resolve_label_set(rows: Sequence[Dict[str, Any]], requested: str) -> str:
+    if requested != "auto":
+        return requested
+    for prefix in ("adj", "gold"):
+        if any(str(r.get(f"{prefix}_{lb}", "")).strip()
+               for r in rows for lb in LABEL_NAMES):
+            return prefix
+    return "gold"
+
+
+def labelled_rows(data: Path, label_set: str):
+    rows = read_jsonl(data / "pilot_labelled.jsonl")
+    key = resolve_label_set(rows, label_set)
+    rows = [r for r in rows
+            if any(str(r.get(f"{key}_{lb}", "")).strip() for lb in LABEL_NAMES)]
+    return rows, key
+
+
 def cmd_corpus(args) -> int:
     data = Path(args.data)
     if args.source == "pmc":
@@ -86,52 +108,76 @@ def cmd_pilot(args) -> int:
     chosen = C.stratified_pilot(rows, n_total=args.n, seed=args.seed,
                                 max_per_article=args.max_per_article)
     write_csv(data / "pilot_blind.csv", C.blind_sheet(chosen))
-    print(f"pilot {len(chosen)} legends -> {data / 'pilot_blind.csv'}")
-    print("fill the manual_* columns with P / N / U, then run: labels")
+    write_csv(data / "span_sheet_TO_FILL.csv", SP.span_sheet(chosen))
+    print(f"pilot {len(chosen)} legends")
+    print(f"  label sheet  {data / 'pilot_blind.csv'}   fill manual_* with P / N / U")
+    print(f"  span sheet   {data / 'span_sheet_TO_FILL.csv'}   paste the exact "
+          f"phrases that justify each PRESENT, separated by |")
     return 0
 
 
 def cmd_labels(args) -> int:
     data = Path(args.data)
-    rows = {r["legend_id"]: r for r in read_jsonl(data / "corpus.jsonl")}
-    gold = C.parse_sheet(read_csv(Path(args.sheet)))
-    out: List[Dict[str, Any]] = []
-    for lid, vals in gold.items():
-        if lid not in rows:
+    rows = {r["legend_id"]: dict(r) for r in read_jsonl(data / "corpus.jsonl")}
+    ingested: List[str] = []
+    order: List[str] = []
+    for flag, prefix in ANNOTATOR_PREFIX.items():
+        path = getattr(args, flag)
+        if not path:
             continue
-        rec = dict(rows[lid])
-        for lb, v in vals.items():
-            rec[f"gold_{lb}"] = v
-        out.append(rec)
+        for lid, vals in C.parse_sheet(read_csv(Path(path))).items():
+            if lid not in rows:
+                continue
+            if prefix == "gold":
+                order.append(lid)
+            for lb, v in vals.items():
+                rows[lid][f"{prefix}_{lb}"] = v
+        ingested.append(prefix)
+    out = [rows[lid] for lid in order]
+    print(f"ingested label sets: {', '.join(ingested)}  ({len(out)} legends)")
 
-    if args.sheet2:
-        second = C.parse_sheet(read_csv(Path(args.sheet2)))
-        for rec in out:
-            for lb, v in second.get(rec["legend_id"], {}).items():
-                rec[f"gold2_{lb}"] = v
-        table = ev.agreement_table(out, "gold", "gold2")
+    table: List[Dict[str, Any]] = []
+    for prefix, name in (("human3", "inter-annotator: A1 vs A2"),
+                         ("human2", "intra-annotator: A1 round 1 vs round 2")):
+        if prefix not in ingested:
+            continue
+        for r in ev.agreement_table(out, "gold", prefix):
+            table.append({"comparison": name, **r})
+    if table:
         write_csv(data / "results" / "agreement.csv", table)
         for r in table:
-            print(f"{r['label']:32s} n={r['n']:4d} kappa={r['cohen_kappa']} "
-                  f"pabak={r.get('pabak')} alpha={r['krippendorff_alpha']}")
+            print(f"  {r['comparison'][:24]:24s} {r['label']:32s} "
+                  f"n={r['n']:4d} kappa={r['cohen_kappa']} pabak={r.get('pabak')} "
+                  f"alpha={r['krippendorff_alpha']}")
+
+    if args.adjudication:
+        out, n = C.apply_adjudication(out, read_csv(Path(args.adjudication)), "gold")
+        print(f"adjudication applied: {n} overridden judgements -> adj_*")
+    elif "human3" in ingested:
+        sheet = C.adjudication_sheet(out, "gold", "human3")
+        write_csv(data / "adjudication_TO_FILL.csv", sheet)
+        print(f"{len(sheet)} disagreement(s) -> {data / 'adjudication_TO_FILL.csv'}; "
+              f"fill the adjudicated column and re-run with --adjudication")
 
     write_jsonl(data / "pilot_labelled.jsonl", out)
-    print(f"{len(out)} labelled legends -> {data / 'pilot_labelled.jsonl'}")
+    print(f"written {data / 'pilot_labelled.jsonl'}")
     return 0
 
 
 def _mcnemar_table(y_true, mask, preds: Dict[str, Any], reference: str = "rules"
                    ) -> List[Dict[str, Any]]:
-    rows, pvals = [], []
+    rows: List[Dict[str, Any]] = []
     for name, p in preds.items():
         if name == reference:
             continue
-        for j, lb in enumerate(LABEL_NAMES):
-            m = ev.mcnemar(y_true, preds[reference], p, mask, j)
-            rows.append({"model_a": reference, "model_b": name, "label": lb, **m})
-            pvals.append(m["p_value"])
-    for r, adj in zip(rows, ev.holm_bonferroni(pvals)):
-        r["p_holm"] = adj
+        family = [{"model_a": reference, "model_b": name, "label": lb,
+                   **ev.mcnemar(y_true, preds[reference], p, mask, j)}
+                  for j, lb in enumerate(LABEL_NAMES)]
+        adjusted = ev.holm_bonferroni([r["p_value"] for r in family])
+        for r, adj in zip(family, adjusted):
+            r["p_holm"] = adj
+            r["family_size"] = len(family)
+        rows += family
     return rows
 
 
@@ -145,13 +191,32 @@ def _report(title: str, summary: List[Dict[str, Any]]) -> None:
               f"{r['macro_precision']:7.3f} {r['macro_recall']:7.3f}")
 
 
+def _fit_cv(name, X, Y, M, rows, folds, seed):
+    oof = np.zeros_like(Y)
+    for train_idx, test_idx in folds:
+        mdl = build_model_zoo()[name]
+        if hasattr(mdl, "set_thresholds") and len(train_idx) >= 25:
+            inner_tr, inner_dv = ev.grouped_holdout(train_idx, rows, frac=0.2,
+                                                    seed=seed)
+            if not inner_dv or not inner_tr:
+                inner_tr, inner_dv = train_idx, train_idx
+            mdl.fit([X[i] for i in inner_tr], Y[inner_tr], M[inner_tr])
+            th = tune_thresholds(mdl, [X[i] for i in inner_dv],
+                                 Y[inner_dv], M[inner_dv])
+            mdl.fit([X[i] for i in train_idx], Y[train_idx], M[train_idx])
+            mdl.set_thresholds(th)
+        else:
+            mdl.fit([X[i] for i in train_idx], Y[train_idx], M[train_idx])
+        oof[test_idx] = mdl.predict([X[i] for i in test_idx])
+    return oof
+
+
 def cmd_train(args) -> int:
     data = Path(args.data)
     res_dir = data / "results"
     silver = read_jsonl(data / "corpus.jsonl")
-    gold = read_jsonl(data / "pilot_labelled.jsonl")
-    gold = [r for r in gold
-            if any(str(r.get(f"gold_{lb}", "")).strip() for lb in LABEL_NAMES)]
+    gold, lkey = labelled_rows(data, args.label_set)
+    print(f"label set: {lkey}_*  ({len(gold)} annotated legends)")
 
     splits = ev.build_splits(silver, gold, seed=args.seed)
     tr, dv, te = splits["silver_train"], splits["silver_dev"], splits["gold_test"]
@@ -160,11 +225,10 @@ def cmd_train(args) -> int:
     Xte = [r["caption"] for r in te]
     Ytr, Mtr = (np.array(a) for a in ev.binary_targets(tr, "silver"))
     Ydv, Mdv = (np.array(a) for a in ev.binary_targets(dv, "silver"))
-    Yte, Mte = (np.array(a) for a in ev.binary_targets(te, "gold"))
-    print(f"silver_train={len(tr)}  silver_dev={len(dv)}  gold_test={len(te)}")
+    Yte, Mte = (np.array(a) for a in ev.binary_targets(te, lkey))
+    print(f"silver_train={len(tr)}  silver_dev={len(dv)}  benchmark={len(te)}")
 
     per_label: List[Dict[str, Any]] = []
-
     zoo = build_model_zoo()
     tuned: Dict[str, Any] = {}
     for name, mdl in zoo.items():
@@ -189,9 +253,10 @@ def cmd_train(args) -> int:
               flush=True)
 
     summary_a = ev.summary_table(results, boots)
-    write_csv(res_dir / "model_summary_regime_a.csv", summary_a)
-    write_csv(res_dir / "mcnemar_regime_a.csv", _mcnemar_table(Yte, Mte, preds))
-    _report("REGIME A -- train on silver labels, test on the annotated pilot",
+    write_csv(res_dir / f"model_summary_regime_a_{lkey}.csv", summary_a)
+    write_csv(res_dir / f"mcnemar_regime_a_{lkey}.csv",
+              _mcnemar_table(Yte, Mte, preds))
+    _report("REGIME A -- train on silver labels, test on the annotated benchmark",
             summary_a)
 
     (data / "models").mkdir(parents=True, exist_ok=True)
@@ -200,24 +265,9 @@ def cmd_train(args) -> int:
             pickle.dump(zoo[name], fh)
 
     folds = ev.gold_cv_folds(te, k=args.cv_folds, seed=args.seed)
-    cv_summary, cv_preds, cv_boots, cv_results = [], {}, {}, {}
+    cv_preds, cv_boots, cv_results = {}, {}, {}
     for name in LADDER:
-        oof = np.zeros_like(Yte)
-        for train_idx, test_idx in folds:
-            mdl = build_model_zoo()[name]
-            if hasattr(mdl, "set_thresholds") and len(train_idx) >= 25:
-                inner_tr, inner_dv = ev.grouped_holdout(train_idx, te, frac=0.2,
-                                                        seed=args.seed)
-                if not inner_dv or not inner_tr:
-                    inner_tr, inner_dv = train_idx, train_idx
-                mdl.fit([Xte[i] for i in inner_tr], Yte[inner_tr], Mte[inner_tr])
-                th = tune_thresholds(mdl, [Xte[i] for i in inner_dv],
-                                     Yte[inner_dv], Mte[inner_dv])
-                mdl.fit([Xte[i] for i in train_idx], Yte[train_idx], Mte[train_idx])
-                mdl.set_thresholds(th)
-            else:
-                mdl.fit([Xte[i] for i in train_idx], Yte[train_idx], Mte[train_idx])
-            oof[test_idx] = mdl.predict([Xte[i] for i in test_idx])
+        oof = _fit_cv(name, Xte, Yte, Mte, te, folds, args.seed)
         cv_preds[name] = oof
         cv_results[name] = ev.evaluate(Yte, oof, Mte)
         cv_boots[name] = ev.bootstrap_macro_f1(Yte, oof, Mte, n_boot=args.n_boot,
@@ -228,13 +278,111 @@ def cmd_train(args) -> int:
               flush=True)
 
     cv_summary = ev.summary_table(cv_results, cv_boots)
-    write_csv(res_dir / "model_summary_regime_b.csv", cv_summary)
-    write_csv(res_dir / "mcnemar_regime_b.csv", _mcnemar_table(Yte, Mte, cv_preds))
-    write_csv(res_dir / "metrics_per_label.csv", per_label,
+    write_csv(res_dir / f"model_summary_regime_b_{lkey}.csv", cv_summary)
+    write_csv(res_dir / f"mcnemar_regime_b_{lkey}.csv",
+              _mcnemar_table(Yte, Mte, cv_preds))
+    _report(f"REGIME B -- article-grouped {args.cv_folds}-fold CV on the "
+            f"annotated benchmark", cv_summary)
+
+    if args.lock_test_split:
+        lock = ev.lock_test_split(te, Path(args.lock_test_split),
+                                  test_fraction=args.test_fraction, seed=args.seed)
+        parts = ev.apply_lock(te, lock)
+        dev_rows, test_rows = parts["devpool"], parts["test"]
+        Xd = [r["caption"] for r in dev_rows]
+        Xt = [r["caption"] for r in test_rows]
+        Yd, Md = (np.array(a) for a in ev.binary_targets(dev_rows, lkey))
+        Yt, Mt = (np.array(a) for a in ev.binary_targets(test_rows, lkey))
+        locked_summary = []
+        for name in LADDER:
+            mdl = build_model_zoo()[name]
+            mdl.fit(Xd, Yd, Md)
+            if hasattr(mdl, "set_thresholds"):
+                itr, idv = ev.grouped_holdout(list(range(len(dev_rows))), dev_rows,
+                                              frac=0.2, seed=args.seed)
+                if idv:
+                    inner = build_model_zoo()[name]
+                    inner.fit([Xd[i] for i in itr], Yd[itr], Md[itr])
+                    mdl.set_thresholds(tune_thresholds(
+                        inner, [Xd[i] for i in idv], Yd[idv], Md[idv]))
+            pr = mdl.predict(Xt)
+            r = ev.evaluate(Yt, pr, Mt)
+            b = ev.bootstrap_macro_f1(Yt, pr, Mt, n_boot=args.n_boot, seed=args.seed)
+            per_label += ev.metrics_to_rows(name, "locked_test", r)
+            locked_summary.append({
+                "model": name, "macro_f1": r["macro_f1"],
+                "macro_f1_ci95": f"[{b['ci95_low']}, {b['ci95_high']}]",
+                "macro_mcc": r["macro_mcc"], "micro_f1": r["micro_f1"],
+                "n_test": len(test_rows)})
+            print(f"[locked]   {name:14s} macroF1={r['macro_f1']:.3f}", flush=True)
+        locked_summary.sort(key=lambda x: -x["macro_f1"])
+        write_csv(res_dir / f"model_summary_locked_test_{lkey}.csv", locked_summary)
+        print(f"\nLOCKED TEST SPLIT  devpool={len(dev_rows)}  "
+              f"test={len(test_rows)} legends / {lock['n_test_articles']} articles"
+              f"  fingerprint={lock['fingerprint']}  reused={lock['reused']}")
+        print(f"{'model':16s} {'macroF1':>8s} {'95% CI':>16s} {'macroMCC':>9s}")
+        for r in locked_summary:
+            print(f"{r['model']:16s} {r['macro_f1']:8.3f} "
+                  f"{r['macro_f1_ci95']:>16s} {str(r['macro_mcc']):>9s}")
+
+    write_csv(res_dir / f"metrics_per_label_{lkey}.csv", per_label,
               ["model", "split", "label", "support", "n", "tp", "fp", "fn", "tn",
                "precision", "recall", "f1", "mcc", "accuracy"])
-    _report(f"REGIME B -- article-grouped {args.cv_folds}-fold CV on the "
-            f"annotated pilot", cv_summary)
+    print(f"\nwritten to {res_dir}")
+    return 0
+
+
+def cmd_errors(args) -> int:
+    data = Path(args.data)
+    res_dir = data / "results"
+    gold, lkey = labelled_rows(data, args.label_set)
+    X = [r["caption"] for r in gold]
+    Y, M = (np.array(a) for a in ev.binary_targets(gold, lkey))
+    folds = ev.gold_cv_folds(gold, k=args.cv_folds, seed=args.seed)
+    preds = {name: _fit_cv(name, X, Y, M, gold, folds, args.seed)
+             for name in ("rules", "tfidf_lr", "hybrid_lr")}
+
+    write_csv(res_dir / "error_taxonomy.csv", E.taxonomy_table())
+    all_err: List[Dict[str, Any]] = []
+    for name in preds:
+        all_err += E.collect_errors(gold, preds, name, gold_prefix=lkey)
+    write_csv(res_dir / "errors_detail.csv", all_err,
+              ["model", "label", "error_type", "error_codes", "gold", "predicted",
+               "legend_id", "source_id", "n_chars", "rule_evidence",
+               "annotator_note", "caption_excerpt"])
+    write_csv(res_dir / "errors_summary.csv", E.error_summary(all_err, gold))
+    write_csv(res_dir / "complementarity_rules_vs_tfidf.csv",
+              E.complementarity(gold, preds["rules"], preds["tfidf_lr"],
+                                "rules", "tfidf", gold_prefix=lkey))
+    n_rule = sum(1 for e in all_err if e["model"] == "rules")
+    fn = sum(1 for e in all_err if e["model"] == "rules" and e["error_type"] == "fn")
+    print(f"rule-baseline errors on the benchmark: {n_rule} "
+          f"({fn} misses, {n_rule - fn} false alarms)")
+
+    if args.span_sheet:
+        sheet = read_csv(Path(args.span_sheet))
+        caps = {r["legend_id"]: r["caption"] for r in gold}
+        refs = SP.reference_spans_from_sheet(sheet, caps)
+        sres = SP.evaluate_spans(gold, refs, lkey)
+        write_csv(res_dir / "span_metrics.csv", SP.to_rows(sres))
+        print(f"\nSPAN EVALUATION against "
+              f"{sum(sres['per_label'][lb]['n_reference_spans'] for lb in LABEL_NAMES)}"
+              f" human reference spans")
+        print(f"{'element':32s} {'ref':>6s} {'partP':>7s} {'partR':>7s} "
+              f"{'exactP':>7s} {'IoU':>6s} {'RFRR':>6s} {'medch':>6s}")
+        for lb in LABEL_NAMES:
+            r = sres["per_label"][lb]
+            print(f"{lb:32s} {r['n_reference_spans']:6d} "
+                  f"{str(r['span_precision_partial']):>7s} "
+                  f"{str(r['span_recall_partial']):>7s} "
+                  f"{str(r['span_precision_exact']):>7s} "
+                  f"{str(r['mean_iou_of_matches']):>6s} "
+                  f"{str(r['right_for_the_right_reason']):>6s} "
+                  f"{str(r['median_pred_span_chars']):>6s}")
+        m = sres["macro"]
+        print(f"{'MACRO':32s} {'':>6s} {m['span_precision_partial']:>7} "
+              f"{m['span_recall_partial']:>7} {'':>7} {'':>6} "
+              f"{m['right_for_the_right_reason']:>6}")
     print(f"\nwritten to {res_dir}")
     return 0
 
@@ -284,16 +432,33 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("labels")
     p.add_argument("--data", default="data")
-    p.add_argument("--sheet", required=True)
-    p.add_argument("--sheet2", default="")
+    p.add_argument("--sheet", required=True,
+                   help="annotator 1, round 1 -> gold_*")
+    p.add_argument("--retest", default="",
+                   help="annotator 1, round 2 -> human2_*, intra-annotator")
+    p.add_argument("--second", default="",
+                   help="annotator 2 -> human3_*, inter-annotator")
+    p.add_argument("--adjudication", default="",
+                   help="filled adjudication sheet -> adj_*")
     p.set_defaults(func=cmd_labels)
 
     p = sub.add_parser("train")
     p.add_argument("--data", default="data")
+    p.add_argument("--label-set", choices=["auto", "gold", "adj"], default="auto")
+    p.add_argument("--lock-test-split", default="")
+    p.add_argument("--test-fraction", type=float, default=0.30)
     p.add_argument("--n-boot", type=int, default=2000)
     p.add_argument("--cv-folds", type=int, default=5)
     p.add_argument("--seed", type=int, default=RANDOM_SEED)
     p.set_defaults(func=cmd_train)
+
+    p = sub.add_parser("errors")
+    p.add_argument("--data", default="data")
+    p.add_argument("--label-set", choices=["auto", "gold", "adj"], default="auto")
+    p.add_argument("--span-sheet", default="")
+    p.add_argument("--cv-folds", type=int, default=5)
+    p.add_argument("--seed", type=int, default=RANDOM_SEED)
+    p.set_defaults(func=cmd_errors)
 
     p = sub.add_parser("check")
     p.add_argument("--model", default="")
