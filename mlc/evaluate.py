@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import random
 from collections import Counter, defaultdict
 from fractions import Fraction
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -400,3 +403,54 @@ def agreement_table(rows: Sequence[Dict[str, Any]], prefix_a: str, prefix_b: str
                 "cohen_kappa": _r(sum(ks) / len(ks)) if ks else None,
                 "krippendorff_alpha": _r(krippendorff_alpha_nominal([flat_a, flat_b]))})
     return out
+
+
+def fingerprint_ids(legend_ids: Sequence[str]) -> str:
+    h = hashlib.sha256()
+    for lid in sorted(str(i) for i in legend_ids):
+        h.update(lid.encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def lock_test_split(rows: Sequence[Dict[str, Any]], lock_path: Path,
+                    test_fraction: float = 0.30, seed: int = RANDOM_SEED
+                    ) -> Dict[str, Any]:
+    lock_path = Path(lock_path)
+    by_article: Dict[str, List[str]] = defaultdict(list)
+    for r in rows:
+        by_article[str(r.get("source_id", ""))].append(r["legend_id"])
+    if lock_path.exists():
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        known = set(lock["test_article_ids"])
+        now_ids = sorted(i for a in known if a in by_article for i in by_article[a])
+        return {**lock, "reused": True, "current_fingerprint": fingerprint_ids(now_ids)}
+    aids = sorted(by_article)
+    random.Random(seed).shuffle(aids)
+    target = test_fraction * len(rows)
+    test_articles: List[str] = []
+    n = 0
+    for aid in aids:
+        if n >= target:
+            break
+        test_articles.append(aid)
+        n += len(by_article[aid])
+    test_ids = sorted(i for a in test_articles for i in by_article[a])
+    lock = {
+        "created_seed": seed,
+        "test_fraction_requested": test_fraction,
+        "n_test_articles": len(test_articles),
+        "n_test_legends": len(test_ids),
+        "test_article_ids": sorted(test_articles),
+        "fingerprint": fingerprint_ids(test_ids),
+    }
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(json.dumps(lock, indent=2), encoding="utf-8")
+    return {**lock, "reused": False, "current_fingerprint": lock["fingerprint"]}
+
+
+def apply_lock(rows: Sequence[Dict[str, Any]], lock: Dict[str, Any]
+               ) -> Dict[str, List[Dict[str, Any]]]:
+    test_articles = set(lock["test_article_ids"])
+    test = [r for r in rows if str(r.get("source_id", "")) in test_articles]
+    devpool = [r for r in rows if str(r.get("source_id", "")) not in test_articles]
+    return {"devpool": devpool, "test": test}
