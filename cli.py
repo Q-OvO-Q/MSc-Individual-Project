@@ -14,6 +14,7 @@ from mlc import corpus as C
 from mlc import errors as E
 from mlc import evaluate as ev
 from mlc import spans as SP
+from mlc import validity as V
 from mlc.checker import LegendChecker, render_text
 from mlc.config import LABEL_NAMES, PRESENT, RANDOM_SEED
 from mlc.models import LADDER, build_model_zoo, tune_thresholds
@@ -99,6 +100,21 @@ def cmd_corpus(args) -> int:
     for lb in LABEL_NAMES:
         n = sum(1 for r in rows if r[f"silver_{lb}"] == PRESENT)
         print(f"  silver PRESENT {lb:32s} {n / max(1, len(rows)):.3f}")
+    return cmd_validity(args)
+
+
+def cmd_validity(args) -> int:
+    data = Path(args.data)
+    rows = read_jsonl(data / "corpus.jsonl")
+    table = V.selection_dependence(rows)
+    write_csv(data / "results" / "selection_dependence.csv", table)
+    print(f"\nSELECTION DEPENDENCE over {len(rows)} legends")
+    print(f"{'element':32s} {'prev':>6s} {'dep':>6s} {'lexical':>8s} "
+          f"{'figtype':>8s}  verdict")
+    for r in table:
+        print(f"{r['label']:32s} {r['prevalence']:6.3f} "
+              f"{r['selection_dependence']:6.3f} {r['rejected_lexical']:8d} "
+              f"{r['rejected_figure_type']:8d}  {r['verdict']}")
     return 0
 
 
@@ -422,6 +438,10 @@ def main(argv=None) -> int:
     p.add_argument("--target-legends", type=int, default=900)
     p.add_argument("--per-article-cap", type=int, default=3)
     p.set_defaults(func=cmd_corpus)
+
+    p = sub.add_parser("validity")
+    p.add_argument("--data", default="data")
+    p.set_defaults(func=cmd_validity)
 
     p = sub.add_parser("pilot")
     p.add_argument("--data", default="data")
