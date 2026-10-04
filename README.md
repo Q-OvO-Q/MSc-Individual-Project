@@ -1,39 +1,14 @@
-# Microscopy legend reporting-element checker
-
-Detects textual evidence of seven reporting elements in microscopy figure legends.
-It reads legend text only; it never inspects the image and never claims that
-something is missing from a figure.
-
-## Install
-
-```bash
-pip install -r requirements.txt
-```
-
-Python 3.9+.
-
-## Elements
-
-| label | question |
-|---|---|
-| `specimen_named` | does the legend name a specific material or object? |
-| `method_modality` | does it state the imaging method or modality? |
-| `scale_magnification` | does it give a scale bar, physical size, or magnification? |
-| `marker_stain_channel` | does it name a dye, stain, fluorophore, reporter or channel? |
-| `colour_channel_mapping` | is a colour explicitly linked to what it represents? |
-| `panel_position_mapping` | are panel letters or positions mapped to content? |
-| `visual_annotation_explanation` | are arrows, boxes, insets, asterisks explained? |
-
 Values are `PRESENT`, `NOT_DETECTED`, `UNCLEAR`.
 
 ## Pipeline
 
 ```bash
 # 1. build a corpus: XML -> legends -> microscopy filter -> figure-type filter
-#    -> deduplication -> rule pre-annotation (silver labels)
+#    -> deduplication -> rule pre-annotation (silver labels) -> selection dependence
 python cli.py corpus --data data --source elife --n-articles 1500 --target-legends 900
 python cli.py corpus --data data --source pmc --email you@example.org --n-articles 400
 python cli.py corpus --data data --source local --xml-dir /path/to/jats
+python cli.py validity --data data
 
 # 2. draw a stratified pilot; writes a blind label sheet and a span sheet
 python cli.py pilot --data data --n 300
@@ -53,6 +28,18 @@ python cli.py errors --data data --span-sheet span_sheet_FILLED.csv
 # 6. check a legend
 python cli.py check --model data/models/hybrid_lr.pkl --text "Confocal images of ..."
 ```
+
+### Selection dependence
+
+Some inclusion cues are also label evidence ("scale bar" admits a caption and
+counts as scale evidence), so for those elements the corpus is selected on the
+outcome. For each element, every rule evidence span is blanked out with offsets
+preserved and both inclusion gates — the lexical cue filter and the figure-type
+classifier — are re-run on the masked text. Selection dependence is the share of
+the corpus that would then fail, with the gate responsible. `corpus` runs this
+at the end; `validity` runs it on an existing `corpus.jsonl`. Verdicts use
+project thresholds: below 0.05 the prevalence is a reportable finding, 0.05 to
+0.25 descriptive only, 0.25 and above not estimable.
 
 ### Label sets
 
@@ -97,12 +84,13 @@ mlc/config.py     label scheme, conditional prompts, seed
 mlc/lexicons.py   every regex and word list
 mlc/rules.py      the rule detectors and rule features
 mlc/corpus.py     JATS extraction, collection, filters, pilot sampling, sheets
+mlc/validity.py   selection dependence of each element on the inclusion rule
 mlc/models.py     the modelling ladder
 mlc/evaluate.py   metrics, bootstrap, McNemar, agreement, grouped splits, the lock
 mlc/spans.py      span-level evaluation
 mlc/errors.py     the error taxonomy
 mlc/checker.py    the author-facing checker
-cli.py            the six pipeline steps
+cli.py            the pipeline steps
 ```
 
 Seed `20260730` everywhere. Splits are grouped by article.
